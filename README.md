@@ -1,8 +1,10 @@
 # BLOCK SHARE
 
-Secondary royalties on most NFT projects go to the team. Ours don't.
+BLOCKHEADZ uses a 5% creator **royalty enforced on OpenSea**. The royalty payout is routed directly into the BlockShare smart contract instead of a team wallet.
 
-The 5% OpenSea creator royalty is routed directly into a smart contract. When the pot hits the threshold, Chainlink VRF picks 3 random registered BLOCKHEADZ token slots. They claim their ETH. We get nothing from it.
+When the pot hits the threshold, anyone can trigger a draw. Chainlink VRF picks **3 random registered** BLOCKHEADZ token slots. The current holders of those tokens can claim their ETH.
+
+We get nothing from the BlockShare pot.
 
 ---
 
