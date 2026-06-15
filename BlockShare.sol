@@ -435,5 +435,4 @@ contract BlockShare is VRFConsumerBaseV2Plus {
     function initiateOwnershipTransfer(address _newOwner) external onlyOwner {
         transferOwnership(_newOwner);
     }
-    // acceptOwnership() inherited from ConfirmedOwner
 }
