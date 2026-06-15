@@ -40,7 +40,7 @@ Special masks: Deadpool, Ninja, Clown, Skull, Robot, Gas Mask, Oni.
 Secondary royalties don't go to the team. They go into a smart contract. When the pot hits the threshold, Chainlink VRF picks 3 random holders. They claim their ETH. That's it.
 
 Full write-up: [BLOCK_SHARE.md](./BLOCK_SHARE.md)
-Contract source: [contracts/BlockShare.sol](./contracts/BlockShare.sol)
+Contract source: [contracts/BlockShare.sol](./BlockShare.sol)
 
 ---
 
