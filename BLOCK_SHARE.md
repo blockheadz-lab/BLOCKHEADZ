@@ -65,7 +65,7 @@ The registry is seeded before launch with all minted BLOCKHEADZ token IDs. Anyon
 
 ## Contract
 
-Source: [`contracts/BlockShare.sol`](./BlockShare.sol)
+Source: [`BlockShare.sol`](./BlockShare.sol)
 
 Pre-mainnet checklist:
 - Sepolia deploy + full flow test
