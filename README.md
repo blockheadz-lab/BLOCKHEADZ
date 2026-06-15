@@ -4,7 +4,7 @@
 
 4444 generative NFTs on Ethereum.
 
-[Twitter](https://x.com/BLOCKHEADZETH) · [Website](#)
+[Twitter](https://x.com/BLOCKHEADZETH)
 
 </div>
 
