@@ -6,8 +6,6 @@ When the pot hits the threshold, anyone can trigger a draw (once per 24 hours). 
 
 We get nothing from the BlockShare pot.
 
----
-
 ## How it works
 
 ```
@@ -30,8 +28,6 @@ requestRound()  ← anyone can call this (max once per 24hr)
 
 The royalty receiver just accepts ETH. It doesn't try to trigger a draw at the same time — that's a separate step once the pot is ready. Means royalties can land cleanly regardless of what's happening with Chainlink.
 
----
-
 ## Numbers
 
 | | |
@@ -47,11 +43,7 @@ The royalty receiver just accepts ETH. It doesn't try to trigger a draw at the s
 | VRF reserve | 0.5% of incoming royalties |
 | Payout | Winners call claim() |
 
----
-
 All 4,444 BLOCKHEADZ token IDs are seeded into the registry before launch. Holders don't need to register — owning the token is enough. The contract checks `ownerOf` live at draw time, so whoever holds the token at that exact moment wins, even if they bought after the seed.
-
----
 
 ## A few things worth knowing
 
@@ -71,8 +63,6 @@ All 4,444 BLOCKHEADZ token IDs are seeded into the registry before launch. Holde
 
 **Late VRF callbacks are safe.** If a draw is cancelled after the 24-hour timeout and Chainlink eventually delivers anyway, the callback exits silently. No funds move, no revert.
 
----
-
 ## Contract
 
 Source: [`BlockShare.sol`](./BlockShare.sol)
@@ -87,7 +77,5 @@ Pre-mainnet checklist:
 - [ ] Set BlockShare as OpenSea royalty recipient
 - [ ] Transfer ownership to Safe multisig
 - [ ] Call lockConfig()
-
----
 
 This isn't staking. It isn't yield. It's a royalty-funded draw. If nobody trades, the pot doesn't fill. That's it.
