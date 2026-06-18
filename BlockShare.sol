@@ -6,49 +6,84 @@ pragma solidity ^0.8.20;
  *
  * Royalty-funded random holder draw for BLOCKHEADZ NFT holders.
  * 5% OpenSea creator royalty routes to this contract.
- * When pot reaches threshold, anyone calls requestRound().
+ * When pot reaches threshold, anyone calls requestRound() (max once per day).
  * Chainlink VRF v2.5 selects 3 unique registered token slots.
  * Winners call claim() to receive their ETH. Team takes zero.
+ * 0.5% of incoming royalties auto-reserved for VRF operational costs.
+ *
+ * Design notes:
+ *   - Registry is frozen while a round is in progress (noActiveRound modifier).
+ *   - Supply is snapshotted at VRF request time and used in the callback.
+ *   - requestRound() and triggerRound() both require configLocked.
+ *   - requestRound() enforces a 24hr cooldown between rounds.
+ *   - setCallbackGas() is locked after configLocked.
+ *   - cancelStuckRound() is permissionless after 24hr.
+ *   - 3 unique token slots, not 3 unique addresses.
+ *   - Invalid slot shares return to pendingPot, not redistributed in same round.
+ *   - Forced ETH (selfdestruct) is not prize money until syncPot() is called.
+ *   - Smart contract NFT holders may be unable to claim if their contract
+ *     cannot make external calls. claimTo() helps but caller must initiate.
+ *   - registeredBy mapping tracks who registered each token.
+ *   - removeStaleToken() lets anyone evict a slot after the holder sells.
+ *   - deregisterToken() lets a holder clean up their own registration.
  */
 
 import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface IERC721Minimal {
     function ownerOf(uint256 tokenId) external view returns (address);
 }
 
-contract BlockShare is VRFConsumerBaseV2Plus {
+interface ILINK {
+    function transfer(address to, uint256 value) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
 
-    // Coordinator: 0xD7f86b4b8Cae7D942340FF628F82735b7a20893a
-    bytes32 constant KEY_HASH      = 0x8077df514608a09f83e4e8d300645594e5d7234665448ba83f51a50f842bd3d9;
-    uint16  constant CONFIRMATIONS = 3;
-    uint32  constant NUM_WORDS     = 3;
-    uint256 constant STUCK_TIMEOUT = 2 hours;
+contract BlockShare is VRFConsumerBaseV2Plus, ReentrancyGuard {
 
-    uint256 public constant WINNERS       = 3;
-    uint256 public constant MIN_THRESHOLD = 0.005 ether;
-    uint256 public constant MAX_THRESHOLD = 1 ether;
+    // Chainlink VRF v2.5 -- values passed via constructor for multi-network safety
+    bytes32 public immutable keyHash;
+    address public immutable linkToken;
+    uint16  constant CONFIRMATIONS  = 3;
+    uint32  constant NUM_WORDS      = 3;
+    uint256 constant STUCK_TIMEOUT  = 24 hours;
+
+    uint256 public constant WINNERS            = 3;
+    uint256 public constant MIN_THRESHOLD      = 0.005 ether;
+    uint256 public constant MAX_THRESHOLD      = 1 ether;
+    uint256 public constant MAX_REGISTER_BATCH = 50;
+    uint256 public constant MAX_CLEANUP_BATCH  = 20;
+    uint32  public constant MAX_CALLBACK_GAS   = 750_000;
+    uint32  public constant MIN_CALLBACK_GAS   = 500_000; // raised minimum per audit
+    uint256 public constant VRF_BPS            = 50;      // 0.5% of royalties → vrfReserve
+    uint256 public constant ROUND_INTERVAL     = 24 hours; // max one draw per day
 
     IERC721Minimal public nftContract;
     uint256        public subscriptionId;
     uint256        public threshold;
     uint32         public callbackGas;
-    bool           public roundLocked;
+    bool           public configLocked;
 
     // ── Eligible token registry ───────────────────────────────────────────────
     uint256[] public eligibleTokenIds;
-    mapping(uint256 => uint256) private eligibleIndexPlusOne; // tokenId => index+1
+    mapping(uint256 => uint256) private eligibleIndexPlusOne;
+    mapping(uint256 => address) public registeredBy; // tokenId → address that registered it
 
     // ── State ─────────────────────────────────────────────────────────────────
     uint256 public pendingPot;
+    uint256 public vrfReserve;    // 0.5% royalty slice reserved for VRF ops
     uint256 public lockedPot;
-    uint256 public totalDistributed;
-    uint256 public totalRefunded;
+    uint256 public totalCredited;
+    uint256 public totalReturnedToPot;
     uint256 public roundCount;
     bool    public roundInProgress;
     uint256 public roundRequestedAt;
+    uint256 public lastRoundAt;   // timestamp of last round *request* (not settlement) -- intentional: prevents VRF spam
     uint256 public activeRequestId;
+    uint256 public pendingSubscriptionId;     // two-step subscription update
+    uint256 public subscriptionChangeReadyAt; // two-step subscription update
 
     mapping(address => uint256) public claimable;
     uint256 public totalClaimable;
@@ -57,59 +92,103 @@ contract BlockShare is VRFConsumerBaseV2Plus {
         uint256    timestamp;
         uint256    pot;
         uint256    distributed;
-        uint256    refunded;
+        uint256    returnedToPot;
         uint256[3] tokenIds;
         address[3] winners;
         uint256    shareEach;
     }
 
-    Round[] public roundHistory;
+    Round[] private _roundHistory;
 
     struct PendingRound {
         uint256 pot;
+        uint256 supply;   // snapshotted at request time
         bool    fulfilled;
     }
     mapping(uint256 => PendingRound) public pendingRounds;
 
     // ── Events ────────────────────────────────────────────────────────────────
     event RoyaltyReceived(uint256 amount, uint256 pendingPot);
-    event RoundRequested(uint256 indexed requestId, uint256 pot);
-    event RoundSettled(uint256 indexed roundId, address[3] winners, uint256[3] tokenIds, uint256 shareEach, uint256 distributed, uint256 refunded);
-    event RoundCancelled(uint256 indexed requestId, uint256 potRefunded);
-    event WinnerClaimed(address indexed winner, uint256 amount);
-    event TokenRegistered(uint256 indexed tokenId);
+    event RoundRequested(uint256 indexed requestId, uint256 pot, uint256 supply);
+    event RoundSettled(uint256 indexed roundId, address[3] winners, uint256[3] tokenIds, uint256 shareEach, uint256 distributed, uint256 returnedToPot);
+    event RoundReturned(uint256 indexed requestId, uint256 pot, string reason);
+    event RoundCancelled(uint256 indexed requestId, uint256 returnedToPot);
+    event WinnerClaimed(address indexed winner, address indexed recipient, uint256 amount);
+    event TokenRegistered(uint256 indexed tokenId, address indexed registrant);
+    event TokenSkipped(uint256 indexed tokenId);
     event TokenRemoved(uint256 indexed tokenId);
+    event TokenStaleRemoved(uint256 indexed tokenId, address indexed oldRegistrant, address indexed newOwner);
+    event TokenDeregistered(uint256 indexed tokenId, address indexed registrant);
+    event PotSynced(uint256 amount);
+    event VrfReserveWithdrawn(uint256 amount);
     event ThresholdUpdated(uint256 oldVal, uint256 newVal);
     event CallbackGasUpdated(uint32 oldVal, uint32 newVal);
+    event SubscriptionIdProposed(uint256 oldId, uint256 proposedId, uint256 readyAt);
     event SubscriptionIdUpdated(uint256 oldId, uint256 newId);
-    event NftContractUpdated(address indexed newContract);
+    event ConfigLocked();
+
+    // ── Modifiers ─────────────────────────────────────────────────────────────
+
+    /**
+     * @dev Blocks registry mutations while a VRF round is in flight.
+     *      Prevents supply/index changes between request and callback.
+     */
+    modifier noActiveRound() {
+        require(!roundInProgress, "Round in progress");
+        _;
+    }
 
     // ── Constructor ───────────────────────────────────────────────────────────
+    /**
+     * @param _vrfCoordinator  Chainlink VRF coordinator (network-specific)
+     * @param _keyHash         VRF key hash (network-specific)
+     * @param _linkToken       LINK token address (network-specific)
+     * @param _nftContract     BLOCKHEADZ NFT contract
+     * @param _subscriptionId  Chainlink VRF subscription ID
+     *
+     * Ethereum Mainnet:
+     *   coordinator  0xD7f86b4b8Cae7D942340FF628F82735b7a20893a
+     *   keyHash      0x8077df514608a09f83e4e8d300645594e5d7234665448ba83f51a50f842bd3d9
+     *   linkToken    0x514910771AF9Ca656af840dff83E8264EcF986CA
+     *
+     * Sepolia:
+     *   coordinator  0x9DdfaCa8183c41ad55329BdeeD9F6A8d53168B1b
+     *   keyHash      0x787d74caea10b2b357790d5b5247c2f63d1d91572a9846f780606e4d953677ae
+     *   linkToken    0x779877A7B0D9E8603169DdbD7836e478b4624789
+     */
     constructor(
         address _vrfCoordinator,
+        bytes32 _keyHash,
+        address _linkToken,
         address _nftContract,
         uint256 _subscriptionId
     ) VRFConsumerBaseV2Plus(_vrfCoordinator) {
+        require(_vrfCoordinator != address(0), "Zero coordinator");
+        require(_keyHash != bytes32(0),     "Zero keyHash");
+        require(_linkToken != address(0),   "Zero LINK address");
         require(_nftContract != address(0), "Zero NFT address");
-        require(_subscriptionId != 0, "Zero subscription");
+        require(_subscriptionId != 0,       "Zero subscription");
+        keyHash        = _keyHash;
+        linkToken      = _linkToken;
         nftContract    = IERC721Minimal(_nftContract);
         subscriptionId = _subscriptionId;
         threshold      = 0.04 ether;
-        callbackGas    = 400_000;
+        callbackGas    = 700_000;
     }
 
-    // ── Receive royalties -- never calls VRF ──────────────────────────────────
+    // ── Receive royalties ─────────────────────────────────────────────────────
     receive() external payable {
-        pendingPot += msg.value;
+        uint256 vrf = (msg.value * VRF_BPS) / 10000;
+        vrfReserve += vrf;
+        pendingPot += msg.value - vrf;
         emit RoyaltyReceived(msg.value, pendingPot);
     }
 
     fallback() external payable {
-        pendingPot += msg.value;
-        emit RoyaltyReceived(msg.value, pendingPot);
+        revert("Invalid call");
     }
 
-    // ── Eligible token registry ───────────────────────────────────────────────
+    // ── Registry -- all mutations blocked during active round ─────────────────
 
     function eligibleSupply() public view returns (uint256) {
         return eligibleTokenIds.length;
@@ -120,50 +199,138 @@ contract BlockShare is VRFConsumerBaseV2Plus {
     }
 
     /**
-     * @notice Register a single minted token ID.
-     *         Anyone can call this. Verified via ownerOf() on the NFT contract.
+     * @notice Returns true only if the token is registered AND still held by the registrant.
+     *         Use this off-chain / in bots to check live eligibility before requestRound().
+     *         Do not call in a loop on-chain — use cleanupRegistry() for batch cleanup instead.
      */
-    function registerToken(uint256 tokenId) public {
+    function isLiveEligible(uint256 tokenId) public view returns (bool) {
+        if (!isEligibleToken(tokenId)) return false;
+        try nftContract.ownerOf(tokenId) returns (address holder) {
+            return holder != address(0) && holder == registeredBy[tokenId];
+        } catch {
+            return false;
+        }
+    }
+
+    function registerToken(uint256 tokenId) public noActiveRound {
         require(!isEligibleToken(tokenId), "Already registered");
         address holder = nftContract.ownerOf(tokenId);
         require(holder != address(0), "Invalid token");
+        require(holder == msg.sender, "Must be token owner");
+        registeredBy[tokenId] = msg.sender;
         eligibleTokenIds.push(tokenId);
         eligibleIndexPlusOne[tokenId] = eligibleTokenIds.length;
-        emit TokenRegistered(tokenId);
+        emit TokenRegistered(tokenId, msg.sender);
     }
 
-    /**
-     * @notice Register multiple token IDs in one call.
-     *         Skips already-registered or invalid tokens silently.
-     *         Use this to seed the registry before the first draw.
-     */
-    function registerTokens(uint256[] calldata tokenIds) external {
+    function registerTokens(uint256[] calldata tokenIds) external noActiveRound {
+        require(tokenIds.length <= MAX_REGISTER_BATCH, "Batch too large -- max 50");
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            if (isEligibleToken(tokenIds[i])) continue;
+            try nftContract.ownerOf(tokenIds[i]) returns (address holder) {
+                if (holder != address(0) && holder == msg.sender) {
+                    registeredBy[tokenIds[i]] = msg.sender;
+                    eligibleTokenIds.push(tokenIds[i]);
+                    eligibleIndexPlusOne[tokenIds[i]] = eligibleTokenIds.length;
+                    emit TokenRegistered(tokenIds[i], msg.sender);
+                } else {
+                    emit TokenSkipped(tokenIds[i]);
+                }
+            } catch {
+                emit TokenSkipped(tokenIds[i]);
+            }
+        }
+    }
+
+    function seedRegistry(uint256[] calldata tokenIds) external onlyOwner noActiveRound {
+        require(!configLocked, "Config locked");
+        require(tokenIds.length <= MAX_REGISTER_BATCH, "Batch too large -- max 50");
         for (uint256 i = 0; i < tokenIds.length; i++) {
             if (isEligibleToken(tokenIds[i])) continue;
             try nftContract.ownerOf(tokenIds[i]) returns (address holder) {
                 if (holder != address(0)) {
+                    registeredBy[tokenIds[i]] = holder;
                     eligibleTokenIds.push(tokenIds[i]);
                     eligibleIndexPlusOne[tokenIds[i]] = eligibleTokenIds.length;
-                    emit TokenRegistered(tokenIds[i]);
+                    emit TokenRegistered(tokenIds[i], holder);
+                } else {
+                    emit TokenSkipped(tokenIds[i]);
                 }
-            } catch {}
+            } catch {
+                emit TokenSkipped(tokenIds[i]);
+            }
         }
     }
 
     /**
-     * @notice Remove a token that is no longer valid (burned or ownerOf reverts).
-     *         Anyone can call this to keep the registry clean.
+     * @notice Remove a single token that is either burned or transferred away from registrant.
+     *         Handles both cases: ownerOf reverts (burned) or owner != registeredBy (stale).
+     *         Use cleanupRegistry() for batch removal.
      */
-    function removeInvalidToken(uint256 tokenId) public {
+    function removeInactiveToken(uint256 tokenId) external noActiveRound {
         require(isEligibleToken(tokenId), "Not registered");
-        bool invalid;
+        address oldRegistrant = registeredBy[tokenId];
+        address currentOwner;
+        bool remove;
         try nftContract.ownerOf(tokenId) returns (address holder) {
-            invalid = (holder == address(0));
+            currentOwner = holder;
+            remove = (holder == address(0) || holder != oldRegistrant);
         } catch {
-            invalid = true;
+            remove = true;
         }
-        require(invalid, "Token still valid");
+        require(remove, "Still held by registrant");
+        delete registeredBy[tokenId];
         _removeEligibleToken(tokenId);
+        if (currentOwner != address(0) && currentOwner != oldRegistrant) {
+            emit TokenStaleRemoved(tokenId, oldRegistrant, currentOwner);
+        } else {
+            emit TokenRemoved(tokenId);
+        }
+    }
+
+    /**
+     * @notice Holder can de-register their own token (e.g. before selling).
+     */
+    function deregisterToken(uint256 tokenId) external noActiveRound {
+        require(isEligibleToken(tokenId), "Not registered");
+        require(registeredBy[tokenId] == msg.sender, "Not your registration");
+        delete registeredBy[tokenId];
+        _removeEligibleToken(tokenId);
+        emit TokenDeregistered(tokenId, msg.sender);
+    }
+
+    function cleanupRegistry(uint256 startIndex) external noActiveRound returns (uint256 nextIndex) {
+        uint256 len = eligibleTokenIds.length;
+        if (len == 0 || startIndex >= len) return 0;
+        uint256 end = startIndex + MAX_CLEANUP_BATCH;
+        if (end > len) end = len;
+        uint256 i = startIndex;
+        while (i < end) {
+            uint256 tokenId = eligibleTokenIds[i];
+            bool remove;
+            address currentOwner;
+            try nftContract.ownerOf(tokenId) returns (address holder) {
+                currentOwner = holder;
+                // remove if burned OR transferred away from registrant
+                remove = (holder == address(0) || holder != registeredBy[tokenId]);
+            } catch {
+                remove = true;
+            }
+            if (remove) {
+                address oldRegistrant = registeredBy[tokenId];
+                delete registeredBy[tokenId];
+                _removeEligibleToken(tokenId);
+                if (currentOwner != address(0) && currentOwner != oldRegistrant) {
+                    emit TokenStaleRemoved(tokenId, oldRegistrant, currentOwner);
+                }
+                end = end > 0 ? end - 1 : 0;
+                len = eligibleTokenIds.length;
+                if (i >= len) break;
+            } else {
+                i++;
+            }
+        }
+        return (i < eligibleTokenIds.length) ? i : 0;
     }
 
     function _removeEligibleToken(uint256 tokenId) internal {
@@ -181,26 +348,29 @@ contract BlockShare is VRFConsumerBaseV2Plus {
         emit TokenRemoved(tokenId);
     }
 
-    // ── Request draw -- public, anyone can call ───────────────────────────────
-    function requestRound() external {
+    // ── Request draw ──────────────────────────────────────────────────────────
+
+    function requestRound() external nonReentrant {
+        require(configLocked, "Config not locked -- call lockConfig() first");
         require(pendingPot >= threshold, "Below threshold");
         require(!roundInProgress, "Round in progress");
+        require(block.timestamp >= lastRoundAt + ROUND_INTERVAL, "Once per day");
         require(eligibleTokenIds.length >= WINNERS, "Eligible supply too small");
         _requestRound();
     }
 
     function _requestRound() internal {
-        if (!roundLocked) roundLocked = true;
-
-        uint256 pot      = pendingPot;
+        uint256 pot    = pendingPot;
+        uint256 supply = eligibleTokenIds.length; // snapshot supply at request time
         pendingPot       = 0;
         lockedPot       += pot;
         roundInProgress  = true;
         roundRequestedAt = block.timestamp;
+        lastRoundAt      = block.timestamp;
 
         uint256 requestId = s_vrfCoordinator.requestRandomWords(
             VRFV2PlusClient.RandomWordsRequest({
-                keyHash:              KEY_HASH,
+                keyHash:              keyHash,
                 subId:                subscriptionId,
                 requestConfirmations: CONFIRMATIONS,
                 callbackGasLimit:     callbackGas,
@@ -211,9 +381,9 @@ contract BlockShare is VRFConsumerBaseV2Plus {
             })
         );
 
-        activeRequestId  = requestId;
-        pendingRounds[requestId] = PendingRound({ pot: pot, fulfilled: false });
-        emit RoundRequested(requestId, pot);
+        activeRequestId          = requestId;
+        pendingRounds[requestId] = PendingRound({pot: pot, supply: supply, fulfilled: false});
+        emit RoundRequested(requestId, pot, supply);
     }
 
     // ── VRF callback ──────────────────────────────────────────────────────────
@@ -225,24 +395,27 @@ contract BlockShare is VRFConsumerBaseV2Plus {
 
         if (pr.fulfilled || pr.pot == 0) return;
 
-        uint256 pot  = pr.pot;
+        uint256 pot    = pr.pot;
+        uint256 supply = pr.supply; // use snapshotted supply, not live array length
         pr.pot       = 0;
         pr.fulfilled = true;
 
         roundInProgress = false;
         activeRequestId = 0;
-        lockedPot      -= pot;
+
+        if (lockedPot >= pot) { lockedPot -= pot; } else { lockedPot = 0; }
 
         if (randomWords.length < WINNERS) {
-            pendingPot    += pot;
-            totalRefunded += pot;
+            pendingPot         += pot;
+            totalReturnedToPot += pot;
+            emit RoundReturned(requestId, pot, "Insufficient random words");
             return;
         }
 
-        uint256 supply = eligibleTokenIds.length;
         if (supply < WINNERS) {
-            pendingPot    += pot;
-            totalRefunded += pot;
+            pendingPot         += pot;
+            totalReturnedToPot += pot;
+            emit RoundReturned(requestId, pot, "Eligible supply too small at request time");
             return;
         }
 
@@ -250,22 +423,26 @@ contract BlockShare is VRFConsumerBaseV2Plus {
         uint256 dust      = pot % WINNERS;
         uint256 roundId   = roundCount++;
 
-        uint256[3] memory indexes = _pickUniqueIndexes(
-            supply,
-            randomWords[0],
-            randomWords[1],
-            randomWords[2]
-        );
+        uint256[3] memory indexes = _pickUniqueIndexes(supply, randomWords[0], randomWords[1], randomWords[2]);
 
         uint256[3] memory tokenIds;
         address[3] memory winners;
         uint256 distributed;
-        uint256 refunded;
-
-        uint256[3] memory invalidTokenIds;
-        uint256 invalidCount;
+        uint256 returnedToPot;
+        uint256[3] memory removedTokenIds; // covers both burned and stale-transferred tokens
+        uint256 removedCount;
 
         for (uint256 i = 0; i < WINNERS; i++) {
+            // Guard: snapshot index may exceed live array if tokens were removed
+            // after the round was cancelled (shouldn't happen with noActiveRound,
+            // but defensive check costs nothing).
+            if (indexes[i] >= eligibleTokenIds.length) {
+                uint256 slot = (i == 0) ? shareEach + dust : shareEach;
+                pendingPot    += slot;
+                returnedToPot += slot;
+                continue;
+            }
+
             uint256 tokenId = eligibleTokenIds[indexes[i]];
             tokenIds[i] = tokenId;
 
@@ -276,11 +453,14 @@ contract BlockShare is VRFConsumerBaseV2Plus {
                 winner = address(0);
             }
 
-            if (winner == address(0)) {
+            // Require current owner matches registeredBy — stale slots (sold tokens)
+            // are treated the same as burned tokens: share returns to pot and slot removed.
+            address registrant = registeredBy[tokenId];
+            if (winner == address(0) || winner != registrant) {
                 uint256 slot = (i == 0) ? shareEach + dust : shareEach;
-                pendingPot += slot;
-                refunded   += slot;
-                invalidTokenIds[invalidCount++] = tokenId;
+                pendingPot    += slot;
+                returnedToPot += slot;
+                removedTokenIds[removedCount++] = tokenId;
                 continue;
             }
 
@@ -291,32 +471,29 @@ contract BlockShare is VRFConsumerBaseV2Plus {
             distributed       += credit;
         }
 
-        for (uint256 j = 0; j < invalidCount; j++) {
-            if (isEligibleToken(invalidTokenIds[j])) {
-                _removeEligibleToken(invalidTokenIds[j]);
+        for (uint256 j = 0; j < removedCount; j++) {
+            if (isEligibleToken(removedTokenIds[j])) {
+                delete registeredBy[removedTokenIds[j]];
+                _removeEligibleToken(removedTokenIds[j]);
             }
         }
 
-        totalDistributed += distributed;
-        totalRefunded    += refunded;
+        totalCredited   += distributed;
+        totalReturnedToPot += returnedToPot;
 
-        roundHistory.push(Round({
-            timestamp:   block.timestamp,
-            pot:         pot,
-            distributed: distributed,
-            refunded:    refunded,
-            tokenIds:    tokenIds,
-            winners:     winners,
-            shareEach:   shareEach
+        _roundHistory.push(Round({
+            timestamp:    block.timestamp,
+            pot:          pot,
+            distributed:  distributed,
+            returnedToPot: returnedToPot,
+            tokenIds:     tokenIds,
+            winners:      winners,
+            shareEach:    shareEach
         }));
 
-        emit RoundSettled(roundId, winners, tokenIds, shareEach, distributed, refunded);
+        emit RoundSettled(roundId, winners, tokenIds, shareEach, distributed, returnedToPot);
     }
 
-    /**
-     * @dev Deterministic unique index selection -- no loops, O(1), guaranteed unique.
-     *      Partial Fisher-Yates arithmetic over the eligible registry.
-     */
     function _pickUniqueIndexes(
         uint256 supply,
         uint256 r0,
@@ -324,11 +501,9 @@ contract BlockShare is VRFConsumerBaseV2Plus {
         uint256 r2
     ) internal pure returns (uint256[3] memory idx) {
         idx[0] = r0 % supply;
-
         uint256 x1 = r1 % (supply - 1);
         if (x1 >= idx[0]) x1 += 1;
         idx[1] = x1;
-
         uint256 x2 = r2 % (supply - 2);
         uint256 lo = idx[0] < idx[1] ? idx[0] : idx[1];
         uint256 hi = idx[0] < idx[1] ? idx[1] : idx[0];
@@ -338,43 +513,61 @@ contract BlockShare is VRFConsumerBaseV2Plus {
     }
 
     // ── Claim ─────────────────────────────────────────────────────────────────
-    function claim() external {
-        uint256 amount = claimable[msg.sender];
-        require(amount > 0, "Nothing to claim");
-        claimable[msg.sender] = 0;
-        totalClaimable       -= amount;
-        (bool sent, ) = msg.sender.call{value: amount}("");
-        require(sent, "Transfer failed");
-        emit WinnerClaimed(msg.sender, amount);
+
+    function claim() external nonReentrant {
+        _claim(msg.sender, payable(msg.sender));
     }
 
-    // ── Cancel stuck round ────────────────────────────────────────────────────
-    function cancelStuckRound(uint256 requestId) external onlyOwner {
+    function claimTo(address payable recipient) external nonReentrant {
+        require(recipient != address(0), "Zero recipient");
+        _claim(msg.sender, recipient);
+    }
+
+    function _claim(address account, address payable recipient) internal {
+        uint256 amount = claimable[account];
+        require(amount > 0, "Nothing to claim");
+        claimable[account] = 0;
+        totalClaimable    -= amount;
+        (bool sent, ) = recipient.call{value: amount}("");
+        require(sent, "Transfer failed");
+        emit WinnerClaimed(account, recipient, amount);
+    }
+
+    // ── Cancel stuck round -- permissionless after 24hr ───────────────────────
+    function cancelStuckRound(uint256 requestId) external {
         require(roundInProgress, "No round in progress");
-        require(block.timestamp >= roundRequestedAt + STUCK_TIMEOUT, "Too early - wait 2hr");
+        require(block.timestamp >= roundRequestedAt + STUCK_TIMEOUT, "Too early - wait 24hr");
         require(requestId == activeRequestId, "Not active request");
         PendingRound storage pr = pendingRounds[requestId];
-        require(!pr.fulfilled, "Already fulfilled");
-        require(pr.pot > 0, "No pot");
+        require(!pr.fulfilled && pr.pot > 0, "Invalid request");
+
         uint256 pot  = pr.pot;
         pr.pot       = 0;
         pr.fulfilled = true;
         roundInProgress = false;
         activeRequestId = 0;
-        lockedPot      -= pot;
-        pendingPot     += pot;
-        totalRefunded  += pot;
+
+        if (lockedPot >= pot) { lockedPot -= pot; } else { lockedPot = 0; }
+
+        pendingPot         += pot;
+        totalReturnedToPot += pot;
         emit RoundCancelled(requestId, pot);
     }
 
     // ── View ──────────────────────────────────────────────────────────────────
-    function getRoundHistory() external view returns (Round[] memory) {
-        return roundHistory;
+
+    function getRound(uint256 index) external view returns (Round memory) {
+        require(index < _roundHistory.length, "Out of range");
+        return _roundHistory[index];
+    }
+
+    function roundHistoryLength() external view returns (uint256) {
+        return _roundHistory.length;
     }
 
     function getLastRound() external view returns (Round memory) {
-        require(roundHistory.length > 0, "No rounds yet");
-        return roundHistory[roundHistory.length - 1];
+        require(_roundHistory.length > 0, "No rounds yet");
+        return _roundHistory[_roundHistory.length - 1];
     }
 
     function contractBalance() external view returns (uint256) {
@@ -382,44 +575,87 @@ contract BlockShare is VRFConsumerBaseV2Plus {
     }
 
     function availableToWithdraw() public view returns (uint256) {
-        uint256 owed = pendingPot + lockedPot + totalClaimable;
+        uint256 owed = pendingPot + lockedPot + totalClaimable + vrfReserve;
         uint256 bal  = address(this).balance;
         return bal > owed ? bal - owed : 0;
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
+
+    function syncPot() external {
+        uint256 excess = availableToWithdraw();
+        if (excess > 0) {
+            pendingPot += excess;
+            emit PotSynced(excess);
+        }
+    }
+
+    function withdrawVrfReserve() external onlyOwner {
+        uint256 amt = vrfReserve;
+        require(amt > 0, "No VRF reserve");
+        vrfReserve = 0;
+        (bool sent, ) = payable(owner()).call{value: amt}("");
+        require(sent, "Transfer failed");
+        emit VrfReserveWithdrawn(amt);
+    }
+
+    function lockConfig() external onlyOwner {
+        require(!configLocked, "Already locked");
+        configLocked = true;
+        emit ConfigLocked();
+    }
+
     function setNftContract(address _nft) external onlyOwner {
-        require(!roundLocked, "NFT locked after first round request");
+        require(!configLocked, "Config locked");
         require(_nft != address(0), "Zero address");
         nftContract = IERC721Minimal(_nft);
-        emit NftContractUpdated(_nft);
     }
 
     function setThreshold(uint256 _threshold) external onlyOwner {
-        require(!roundLocked, "Threshold locked after first round request");
+        require(!configLocked, "Config locked");
         require(_threshold >= MIN_THRESHOLD, "Below min 0.005 ETH");
         require(_threshold <= MAX_THRESHOLD, "Above max 1 ETH");
         emit ThresholdUpdated(threshold, _threshold);
         threshold = _threshold;
     }
 
+    // callbackGas locked after configLocked -- prevents griefing via low gas
     function setCallbackGas(uint32 _gas) external onlyOwner {
-        require(_gas >= 100_000, "Too low");
-        require(_gas <= 2_500_000, "Above coordinator max");
+        require(!configLocked, "Config locked");
+        require(_gas >= MIN_CALLBACK_GAS, "Too low");
+        require(_gas <= MAX_CALLBACK_GAS, "Too high");
         emit CallbackGasUpdated(callbackGas, _gas);
         callbackGas = _gas;
     }
 
-    function setSubscriptionId(uint256 _subId) external onlyOwner {
+    uint256 public constant SUBSCRIPTION_CHANGE_DELAY = 24 hours;
+
+    function proposeSubscriptionId(uint256 _subId) external onlyOwner {
         require(!roundInProgress, "Round in progress");
         require(_subId != 0, "Zero subscription");
-        emit SubscriptionIdUpdated(subscriptionId, _subId);
-        subscriptionId = _subId;
+        pendingSubscriptionId     = _subId;
+        subscriptionChangeReadyAt = block.timestamp + SUBSCRIPTION_CHANGE_DELAY;
+        emit SubscriptionIdProposed(subscriptionId, _subId, subscriptionChangeReadyAt);
     }
 
+    function acceptSubscriptionId() external onlyOwner {
+        require(pendingSubscriptionId != 0, "No pending subscription");
+        require(block.timestamp >= subscriptionChangeReadyAt, "Delay not passed");
+        require(!roundInProgress, "Round in progress");
+        uint256 oldId          = subscriptionId;
+        uint256 newId          = pendingSubscriptionId;
+        subscriptionId         = newId;
+        pendingSubscriptionId  = 0;
+        subscriptionChangeReadyAt = 0;
+        emit SubscriptionIdUpdated(oldId, newId);
+    }
+
+    // triggerRound also requires configLocked -- consistent with requestRound
     function triggerRound() external onlyOwner {
+        require(configLocked, "Config not locked");
         require(pendingPot >= threshold, "Below threshold");
         require(!roundInProgress, "Round in progress");
+        require(block.timestamp >= lastRoundAt + ROUND_INTERVAL, "Once per day");
         require(eligibleTokenIds.length >= WINNERS, "Eligible supply too small");
         _requestRound();
     }
@@ -432,7 +668,16 @@ contract BlockShare is VRFConsumerBaseV2Plus {
         require(sent, "Transfer failed");
     }
 
+    function withdrawLink() external onlyOwner {
+        require(!roundInProgress, "Round in progress");
+        ILINK link = ILINK(linkToken);
+        uint256 bal = link.balanceOf(address(this));
+        require(bal > 0, "No LINK");
+        require(link.transfer(owner(), bal), "LINK transfer failed");
+    }
+
     function initiateOwnershipTransfer(address _newOwner) external onlyOwner {
         transferOwnership(_newOwner);
     }
+    // acceptOwnership() inherited from ConfirmedOwner
 }
