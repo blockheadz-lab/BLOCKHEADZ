@@ -51,9 +51,11 @@ All 4,444 BLOCKHEADZ token IDs are seeded into the registry before launch. Holde
 
 **No loops in the draw.** Picking 3 unique token slots uses a fixed deterministic method — no retry loops in the VRF callback, predictable gas every time.
 
-**Failed slots roll back.** If a selected token was transferred after seeding, the new unregistered owner does not win — that share returns to the pot and the slot is auto-removed.
+**Failed slots roll back.** If a selected token is burned or invalid, that share goes back into the pot. Not to us.
 
-**Stale slots clean themselves.** If a token is sold and selected by VRF before cleanup, the share returns to the pot. `cleanupRegistry()` can be called by anyone to evict stale slots between draws.
+**Transfers are transparent.** If a token is sold between the seed and the draw, the new owner wins automatically. No re-registration needed — the contract checks `ownerOf` live at draw time.
+
+**Burned tokens clean themselves.** If a burned token is selected by VRF, the share returns to the pot and the slot is auto-removed. `cleanupRegistry()` can be called by anyone to remove burned slots proactively.
 
 **Settings lock permanently.** NFT contract, threshold, and callback gas are configurable before launch. Once `lockConfig()` is called they're locked forever.
 
