@@ -1,5 +1,3 @@
-// BLOCKHEADZ public-safe demo constants.
-// Clean demo: one robot base, three public character presets, one tunnel.
 
 export const FLOAT = { amp: 20, speed: 1.2, wobble: 0.05, pulse: 0.015 };
 export const WALK  = { speed: 1.3, stride: 32, lift: 12 };
