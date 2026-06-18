@@ -1,0 +1,9 @@
+{
+  "name": "blockheadz-public-console-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Public-safe BLOCKHEADZ p5.js/WebGL generative console demo.",
+  "scripts": {
+    "start": "python3 -m http.server 3000"
+  }
+}

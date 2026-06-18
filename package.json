@@ -1,0 +1,9 @@
+{
+  "name": "blockheadz",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BLOCKHEADZ contracts and public generative console demo.",
+  "scripts": {
+    "demo": "cd public-demo && python3 -m http.server 3000"
+  }
+}
