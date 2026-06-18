@@ -2,7 +2,7 @@
 
 BLOCKHEADZ uses a 5% creator **royalty enforced on OpenSea**. The royalty payout is routed directly into the BlockShare smart contract instead of a team wallet.
 
-When the pot hits the threshold, anyone can trigger a draw. Chainlink VRF picks **3 random registered** BLOCKHEADZ token slots. The current holders of those tokens can claim their ETH.
+When the pot hits the threshold, anyone can trigger a draw (once per 24 hours). Chainlink VRF picks **3 random registered** BLOCKHEADZ token slots. The current holders of those tokens can claim their ETH.
 
 We get nothing from the BlockShare pot.
 
@@ -13,19 +13,19 @@ We get nothing from the BlockShare pot.
 ```
 OpenSea secondary sale
         │
-        │  5% creator royalty
+        │  5% creator royalty (0.5% → VRF reserve, 99.5% → pot)
         ▼
 BlockShare.sol  ← pot builds up here
         │
         │  pot >= 0.04 ETH?
         ▼
-requestRound()  ← anyone can call this
+requestRound()  ← anyone can call this (max once per 24hr)
         │
-        │  Chainlink VRF
+        │  Chainlink VRF v2.5
         ▼
 3 random token slots selected
         │
-        └── holders claim their ETH share
+        └── current holders call claim() → ETH sent to wallet
 ```
 
 The royalty receiver just accepts ETH. It doesn't try to trigger a draw at the same time — that's a separate step once the pot is ready. Means royalties can land cleanly regardless of what's happening with Chainlink.
@@ -43,25 +43,33 @@ The royalty receiver just accepts ETH. It doesn't try to trigger a draw at the s
 | Winners per draw | 3 |
 | Split | Equal thirds, dust goes to first winner |
 | Randomness | Chainlink VRF v2.5 |
+| Max draws | 1 per 24 hours |
+| VRF reserve | 0.5% of incoming royalties |
 | Payout | Winners call claim() |
 
 ---
 
-The registry is seeded before launch with all minted BLOCKHEADZ token IDs. Anyone can register newly minted tokens after that via `registerToken(tokenId)`.
+All 4,444 BLOCKHEADZ token IDs are seeded into the registry before launch. Holders don't need to register — owning the token is enough. The contract checks `ownerOf` live at draw time, so whoever holds the token at that exact moment wins, even if they bought after the seed.
 
 ---
 
 ## A few things worth knowing
 
-**The pot is protected.** Emergency withdrawal can't touch the holder pot, locked draw funds, or unclaimed winnings. Only ETH that genuinely isn't owed to anyone can be pulled out.
+**The pot is protected.** Emergency withdrawal can't touch the holder pot, locked draw funds, VRF reserve, or unclaimed winnings. Only ETH that genuinely isn't owed to anyone can be pulled out.
 
 **No loops in the draw.** Picking 3 unique token slots uses a fixed deterministic method — no retry loops in the VRF callback, predictable gas every time.
 
-**Failed slots roll back.** If a selected token can't be resolved, that share goes back into the pot. Not to us.
+**Failed slots roll back.** If a selected token was transferred after seeding, the new unregistered owner does not win — that share returns to the pot and the slot is auto-removed.
 
-**Settings lock after the first draw request.** NFT contract and threshold can be configured before launch. Once the first draw is requested, they're locked permanently.
+**Stale slots clean themselves.** If a token is sold and selected by VRF before cleanup, the share returns to the pot. `cleanupRegistry()` can be called by anyone to evict stale slots between draws.
 
-**Late VRF callbacks are safe.** If a draw is cancelled after the 2hr timeout and Chainlink eventually delivers the random number anyway, the callback exits silently. No funds move, no revert.
+**Settings lock permanently.** NFT contract, threshold, and callback gas are configurable before launch. Once `lockConfig()` is called they're locked forever.
+
+**Subscription ID can be updated.** If the Chainlink VRF subscription ever needs to change, a 24-hour two-step process is required. No surprise changes mid-round.
+
+**Daily limit.** One draw per 24 hours. If the pot fills faster, it accumulates for a bigger prize next day.
+
+**Late VRF callbacks are safe.** If a draw is cancelled after the 24-hour timeout and Chainlink eventually delivers anyway, the callback exits silently. No funds move, no revert.
 
 ---
 
@@ -70,13 +78,15 @@ The registry is seeded before launch with all minted BLOCKHEADZ token IDs. Anyon
 Source: [`BlockShare.sol`](./BlockShare.sol)
 
 Pre-mainnet checklist:
-- Sepolia deploy + full flow test
-- Etherscan verification
-- Seed the BlockShare eligible-token registry with minted BLOCKHEADZ token IDs
-- Add BlockShare as Chainlink VRF consumer
-- Fund VRF subscription
-- Set BlockShare as OpenSea royalty recipient
-- Transfer ownership to Safe multisig
+- [x] 4 independent audit rounds
+- [x] Mainnet fork test — full end-to-end (seed, draw, VRF callback, claim, stale token handling, daily cooldown, cancelStuckRound)
+- [ ] Mainnet deploy + Etherscan verification
+- [ ] Seed registry with all 4,444 BLOCKHEADZ token IDs
+- [ ] Add BlockShare as Chainlink VRF consumer
+- [ ] Fund VRF subscription with LINK
+- [ ] Set BlockShare as OpenSea royalty recipient
+- [ ] Transfer ownership to Safe multisig
+- [ ] Call lockConfig()
 
 ---
 
