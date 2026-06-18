@@ -1,4 +1,4 @@
-// Seeded RNG (Mulberry32) + helpers
+
 export function mulberry32(a){
   return function(){
     let t = a += 0x6D2B79F5;
