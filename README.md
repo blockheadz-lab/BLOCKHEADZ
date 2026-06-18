@@ -1,4 +1,4 @@
-# BLOCKHEADZ — Public Generative Console Demo
+# BLOCKHEADZ Public Generative Console Demo
 
 **BLOCKHEADZ** is a public-safe preview of a code-generated NFT character system built with **p5.js**, **WebGL**, seeded randomness, and modular rendering logic.
 
