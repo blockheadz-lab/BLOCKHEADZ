@@ -10,20 +10,6 @@ It is a simplified public demo designed to show the core idea:
 
 ---
 
-## Live Demo
-
-This repo is ready for GitHub Pages.
-
-After pushing to GitHub, enable:
-
-```txt
-Settings → Pages → Deploy from branch → main → /root
-```
-
-Then open the generated GitHub Pages URL.
-
----
-
 ## What This Demo Includes
 
 - p5.js / WebGL rendering
@@ -107,7 +93,6 @@ npx serve .
 │       ├── hats.js
 │       ├── mouths.js
 │       └── tunnel.js
-├── SAFE_RELEASE_CHECKLIST.md
 └── PUBLIC_DEMO_FILE_MANIFEST.txt
 ```
 
