@@ -26,7 +26,7 @@ requestRound()  ← anyone can call this (max once per 24hr)
         └── current holders call claim() → ETH sent to wallet
 ```
 
-The royalty receiver just accepts ETH. It doesn't try to trigger a draw at the same time — that's a separate step once the pot is ready. Means royalties can land cleanly regardless of what's happening with Chainlink.
+The royalty receiver just accepts ETH. It doesn't try to trigger a draw at the same time that's a separate step once the pot is ready. Means royalties can land cleanly regardless of what's happening with Chainlink
 
 ## Numbers
 
@@ -43,7 +43,7 @@ The royalty receiver just accepts ETH. It doesn't try to trigger a draw at the s
 | VRF reserve | 0.5% of incoming royalties |
 | Payout | Winners call claim() |
 
-All 4,444 BLOCKHEADZ token IDs are seeded into the registry before launch. Holders don't need to register — owning the token is enough. The contract checks `ownerOf` live at draw time, so whoever holds the token at that exact moment wins, even if they bought after the seed.
+All 4,444 BLOCKHEADZ token IDs are seeded into the registry before launch. Holders don't need to register owning the token is enough. The contract checks `ownerOf` live at draw time, so whoever holds the token at that exact moment wins, even if they bought after the seed.
 
 ## A few things worth knowing
 
