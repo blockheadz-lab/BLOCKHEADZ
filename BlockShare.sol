@@ -23,8 +23,9 @@ pragma solidity ^0.8.20;
  *   - Forced ETH (selfdestruct) is not prize money until syncPot() is called.
  *   - Smart contract NFT holders may be unable to claim if their contract
  *     cannot make external calls. claimTo() helps but caller must initiate.
- *   - registeredBy mapping tracks who registered each token.
- *   - removeStaleToken() lets anyone evict a slot after the holder sells.
+ *   - registeredBy mapping tracks who seeded each token (informational only).
+ *   - Transfers are transparent — ownerOf is checked live at draw time.
+ *   - removeInactiveToken() removes burned/invalid tokens only.
  *   - deregisterToken() lets a holder clean up their own registration.
  */
 
@@ -117,7 +118,6 @@ contract BlockShare is VRFConsumerBaseV2Plus, ReentrancyGuard {
     event TokenRegistered(uint256 indexed tokenId, address indexed registrant);
     event TokenSkipped(uint256 indexed tokenId);
     event TokenRemoved(uint256 indexed tokenId);
-    event TokenStaleRemoved(uint256 indexed tokenId, address indexed oldRegistrant, address indexed newOwner);
     event TokenDeregistered(uint256 indexed tokenId, address indexed registrant);
     event PotSynced(uint256 amount);
     event VrfReserveWithdrawn(uint256 amount);
@@ -199,14 +199,14 @@ contract BlockShare is VRFConsumerBaseV2Plus, ReentrancyGuard {
     }
 
     /**
-     * @notice Returns true only if the token is registered AND still held by the registrant.
-     *         Use this off-chain / in bots to check live eligibility before requestRound().
-     *         Do not call in a loop on-chain — use cleanupRegistry() for batch cleanup instead.
+     * @notice Returns true only if the token is registered AND not burned.
+     *         Transfers are fine — the new owner wins automatically.
+     *         Use off-chain before requestRound() to verify registry health.
      */
     function isLiveEligible(uint256 tokenId) public view returns (bool) {
         if (!isEligibleToken(tokenId)) return false;
         try nftContract.ownerOf(tokenId) returns (address holder) {
-            return holder != address(0) && holder == registeredBy[tokenId];
+            return holder != address(0);
         } catch {
             return false;
         }
@@ -263,29 +263,21 @@ contract BlockShare is VRFConsumerBaseV2Plus, ReentrancyGuard {
     }
 
     /**
-     * @notice Remove a single token that is either burned or transferred away from registrant.
-     *         Handles both cases: ownerOf reverts (burned) or owner != registeredBy (stale).
-     *         Use cleanupRegistry() for batch removal.
+     * @notice Remove a single token that is burned or invalid (ownerOf reverts).
+     *         Transferred tokens remain eligible — new owner wins automatically.
      */
     function removeInactiveToken(uint256 tokenId) external noActiveRound {
         require(isEligibleToken(tokenId), "Not registered");
-        address oldRegistrant = registeredBy[tokenId];
-        address currentOwner;
-        bool remove;
+        bool burned;
         try nftContract.ownerOf(tokenId) returns (address holder) {
-            currentOwner = holder;
-            remove = (holder == address(0) || holder != oldRegistrant);
+            burned = (holder == address(0));
         } catch {
-            remove = true;
+            burned = true;
         }
-        require(remove, "Still held by registrant");
+        require(burned, "Token still valid");
         delete registeredBy[tokenId];
         _removeEligibleToken(tokenId);
-        if (currentOwner != address(0) && currentOwner != oldRegistrant) {
-            emit TokenStaleRemoved(tokenId, oldRegistrant, currentOwner);
-        } else {
-            emit TokenRemoved(tokenId);
-        }
+        emit TokenRemoved(tokenId);
     }
 
     /**
@@ -307,22 +299,16 @@ contract BlockShare is VRFConsumerBaseV2Plus, ReentrancyGuard {
         uint256 i = startIndex;
         while (i < end) {
             uint256 tokenId = eligibleTokenIds[i];
-            bool remove;
-            address currentOwner;
+            bool burned;
             try nftContract.ownerOf(tokenId) returns (address holder) {
-                currentOwner = holder;
-                // remove if burned OR transferred away from registrant
-                remove = (holder == address(0) || holder != registeredBy[tokenId]);
+                burned = (holder == address(0));
             } catch {
-                remove = true;
+                burned = true;
             }
-            if (remove) {
-                address oldRegistrant = registeredBy[tokenId];
+            // Only remove burned/invalid tokens — transfers are fine, new owner wins
+            if (burned) {
                 delete registeredBy[tokenId];
                 _removeEligibleToken(tokenId);
-                if (currentOwner != address(0) && currentOwner != oldRegistrant) {
-                    emit TokenStaleRemoved(tokenId, oldRegistrant, currentOwner);
-                }
                 end = end > 0 ? end - 1 : 0;
                 len = eligibleTokenIds.length;
                 if (i >= len) break;
@@ -429,7 +415,7 @@ contract BlockShare is VRFConsumerBaseV2Plus, ReentrancyGuard {
         address[3] memory winners;
         uint256 distributed;
         uint256 returnedToPot;
-        uint256[3] memory removedTokenIds; // covers both burned and stale-transferred tokens
+        uint256[3] memory removedTokenIds; // burned/invalid tokens only
         uint256 removedCount;
 
         for (uint256 i = 0; i < WINNERS; i++) {
@@ -453,10 +439,9 @@ contract BlockShare is VRFConsumerBaseV2Plus, ReentrancyGuard {
                 winner = address(0);
             }
 
-            // Require current owner matches registeredBy — stale slots (sold tokens)
-            // are treated the same as burned tokens: share returns to pot and slot removed.
-            address registrant = registeredBy[tokenId];
-            if (winner == address(0) || winner != registrant) {
+            // Only reject burned/invalid tokens (ownerOf reverts or returns zero).
+            // Transfers are fine — whoever holds the token at draw time wins.
+            if (winner == address(0)) {
                 uint256 slot = (i == 0) ? shareEach + dust : shareEach;
                 pendingPot    += slot;
                 returnedToPot += slot;
