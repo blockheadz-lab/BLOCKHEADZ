@@ -93,7 +93,6 @@ npx serve .
 │       ├── hats.js
 │       ├── mouths.js
 │       └── tunnel.js
-└── PUBLIC_DEMO_FILE_MANIFEST.txt
 ```
 
 ---
