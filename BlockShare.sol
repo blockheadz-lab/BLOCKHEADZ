@@ -26,7 +26,6 @@ pragma solidity ^0.8.20;
  *   - registeredBy mapping tracks who seeded each token (informational only).
  *   - Transfers are transparent — ownerOf is checked live at draw time.
  *   - removeInactiveToken() removes burned/invalid tokens only.
- *   - deregisterToken() lets a holder clean up their own registration.
  */
 
 import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
@@ -118,7 +117,6 @@ contract BlockShare is VRFConsumerBaseV2Plus, ReentrancyGuard {
     event TokenRegistered(uint256 indexed tokenId, address indexed registrant);
     event TokenSkipped(uint256 indexed tokenId);
     event TokenRemoved(uint256 indexed tokenId);
-    event TokenDeregistered(uint256 indexed tokenId, address indexed registrant);
     event PotSynced(uint256 amount);
     event VrfReserveWithdrawn(uint256 amount);
     event ThresholdUpdated(uint256 oldVal, uint256 newVal);
@@ -277,18 +275,7 @@ contract BlockShare is VRFConsumerBaseV2Plus, ReentrancyGuard {
         require(burned, "Token still valid");
         delete registeredBy[tokenId];
         _removeEligibleToken(tokenId);
-        emit TokenRemoved(tokenId);
-    }
-
-    /**
-     * @notice Holder can de-register their own token (e.g. before selling).
-     */
-    function deregisterToken(uint256 tokenId) external noActiveRound {
-        require(isEligibleToken(tokenId), "Not registered");
-        require(registeredBy[tokenId] == msg.sender, "Not your registration");
-        delete registeredBy[tokenId];
-        _removeEligibleToken(tokenId);
-        emit TokenDeregistered(tokenId, msg.sender);
+        // TokenRemoved emitted inside _removeEligibleToken
     }
 
     function cleanupRegistry(uint256 startIndex) external noActiveRound returns (uint256 nextIndex) {
